@@ -1,0 +1,62 @@
+name: Publish Release on Main
+
+on:
+  push:
+    branches:
+      - main
+
+# Give the workflow permission to create releases and tags
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Important: needed for proper git history & tag detection
+
+      # 2. Automatic semantic versioning (recommended)
+      #    Uses date-based versioning: 2025.12.1.1, 2025.12.1.2, etc.
+      - name: Generate next version (date-based)
+        id: version
+        run: |
+          VERSION=$(date +"%Y.%-m.%-d").$(git rev-list --count HEAD).$(openssl rand -hex 3)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "New version: $VERSION"
+
+      # 3. Generate release notes from recent commits
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          # Get commits since last tag (or all if no tags)
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LAST_TAG" ]; then
+            NOTES=$(git log --pretty=format:"- %h %s (%an)" --no-merges)
+          else
+            NOTES=$(git log $LAST_TAG..HEAD --pretty=format:"- %h %s (%an)" --no-merges)
+          fi
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # 4. Create GitHub Release
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Release v${{ steps.version.outputs.version }}
+          body: |
+            ${{ steps.release_notes.outputs.notes }}
+
+            Automated release triggered by commit `${{ github.sha }}`
+          draft: false
+          prerelease: false
+          generate_release_notes: false   # We're providing custom notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.MY_TOKEN }} 
