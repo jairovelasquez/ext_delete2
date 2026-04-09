@@ -245,6 +245,7 @@
           STEP_1: step1Json
         }
       }, { stream: false, preventMenu: true });
+      console.log(step2Result);
       const step2Json = normalizeCoachJson(step2Result, "step2");
       console.info("[Jupyter Hint] step2:success", summarizeCoachResult(step2Json));
 
