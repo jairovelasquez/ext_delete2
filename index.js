@@ -1,8 +1,8 @@
-// Prevent paste in Codio IDE
-// Blocks Ctrl+V, Cmd+V, Shift+Insert, beforeinput insertFromPaste, and paste events.
+// Prevent paste and right click in Codio IDE
+// Blocks Ctrl+V, Cmd+V, Shift+Insert, paste events, and right-click context menu.
 
 (async function (codioIDE, window) {
-  const BLOCK_MESSAGE = "Pasting is disabled for this assignment.";
+  const BLOCK_MESSAGE = "Pasting and right click are disabled for this assignment.";
 
   function isPasteHotkey(event) {
     const key = (event.key || "").toLowerCase();
@@ -14,6 +14,10 @@
       // Some Linux/Windows environments: Shift+Insert
       (event.shiftKey && key === "insert")
     );
+  }
+
+  function isRightClick(event) {
+    return event.button === 2;
   }
 
   function blockEvent(event) {
@@ -28,15 +32,12 @@
   }
 
   function notify() {
-    // Avoid spamming the console/UI too much.
     const now = Date.now();
 
     if (!notify.lastShown || now - notify.lastShown > 2000) {
       notify.lastShown = now;
       console.warn(BLOCK_MESSAGE);
 
-      // Optional: show a CoachBot message if available.
-      // Comment this out if you do not want any UI message.
       if (
         codioIDE &&
         codioIDE.coachBot &&
@@ -47,9 +48,10 @@
     }
   }
 
-  function installPasteBlocker(targetWindow) {
+  function installBlockers(targetWindow) {
     const targetDocument = targetWindow.document;
 
+    // Paste hotkeys
     targetWindow.addEventListener(
       "keydown",
       function (event) {
@@ -72,6 +74,7 @@
       true
     );
 
+    // Paste through menus/browser input events
     targetDocument.addEventListener(
       "beforeinput",
       function (event) {
@@ -94,20 +97,50 @@
       },
       true
     );
+
+    // Right click / context menu
+    targetDocument.addEventListener(
+      "contextmenu",
+      function (event) {
+        notify();
+        return blockEvent(event);
+      },
+      true
+    );
+
+    targetDocument.addEventListener(
+      "mousedown",
+      function (event) {
+        if (isRightClick(event)) {
+          notify();
+          return blockEvent(event);
+        }
+      },
+      true
+    );
+
+    targetDocument.addEventListener(
+      "mouseup",
+      function (event) {
+        if (isRightClick(event)) {
+          notify();
+          return blockEvent(event);
+        }
+      },
+      true
+    );
   }
 
-  // Install on the current window.
-  installPasteBlocker(window);
+  installBlockers(window);
 
   // Best-effort: also install inside same-origin iframes.
-  // This may help if an editor surface is embedded in a frame.
   for (const frame of window.frames) {
     try {
-      installPasteBlocker(frame);
+      installBlockers(frame);
     } catch (e) {
       // Ignore cross-origin frames.
     }
   }
 
-  console.log("Paste blocker extension loaded.");
+  console.log("Paste and right-click blocker extension loaded.");
 })(window.codioIDE, window);
