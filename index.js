@@ -2,7 +2,8 @@
 // Injects a no-copy/no-selection script into Codio Guides pages.
 
 (async function (codioIDE, window) {
-  const GUIDE_SCRIPT_URL = "https://raw.githubusercontent.com/codio-extensions/guides-block-pasting/refs/heads/main/no-copy-guides.js";
+  // const GUIDE_SCRIPT_URL = "https://raw.githubusercontent.com/codio-extensions/guides-block-pasting/refs/heads/main/no-copy-guides.js";
+  const GUIDE_SCRIPT_URL = "https://raw.githubusercontent.com/jairovelasquez/ext_delete2/refs/heads/main/no-copy-guides.js";
 
   if (
     codioIDE &&
