@@ -191,5 +191,5 @@
 
   installBlockers(window);
 
-  // console.log("Copy and guide text-selection blocker loaded.");
+  console.log("Copy and guide text-selection blocker loaded.");
 })(window);
