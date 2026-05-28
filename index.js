@@ -10,7 +10,7 @@
     typeof codioIDE.guides.addScript === "function"
   ) {
     codioIDE.guides.addScript(GUIDE_SCRIPT_URL);
-    // console.log("No-copy guide blocker script registered:", GUIDE_SCRIPT_URL);
+    console.log("No-copy guide blocker script registered:", GUIDE_SCRIPT_URL);
   } else {
     console.warn("codioIDE.guides.addScript is not available.");
   }
