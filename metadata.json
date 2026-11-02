@@ -1,8 +1,8 @@
 {
-  "name": "Block Copy from Guides",
+  "name": "Codio AI Help for Guides",
   "type": "helper",
   "properties": {
-    "user_type": "all", 
+    "user_type": "instructor", 
     "component": "all"
   }
 }
