@@ -1,6 +1,7 @@
 // Codio extension: Copy Logger (debug build)
 // Detects copy actions (Ctrl/Cmd+C, right-click > Copy, Edit menu > Copy)
-// and appends a record of each one to a log file in the workspace.
+// and writes each batch of records to a NEW file, because codioIDE.files.add
+// can only create files, not overwrite them.
 // All console output is prefixed with [copy-logger] so you can filter on it.
 
 (async function (codioIDE, window) {
@@ -13,37 +14,56 @@
 
   // ---------------- Configuration ----------------
   const CONFIG = {
-    logPaths: [
-      "secure/copy-log.jsonl",
-      "copy-log.jsonl",
-      "copy-log.jsonl"
+    // Tried in order; the first folder that accepts a file is used from then on.
+    logDirs: [
+      ".guides/secure/copy-logs",
+      ".guides/copy-logs",
+      "copy-logs"
     ],
     includeCopiedText: false,
     maxTextLength: 500,
     dedupeWindowMs: 250,
+    // Copies within this window share one file. Set to 0 for one file per copy.
     writeDebounceMs: 1000,
     includeGuidesPage: true,
-    apiTimeoutMs: 5000 // any API call slower than this is treated as failed
+    apiTimeoutMs: 5000,
+    maxNameRetries: 3 // new names to try if a file name is somehow taken
   };
 
-  // ---------------- Environment checks ----------------
+  // One ID per page load, so files from the same session sort together
+  const SESSION_ID = new Date().toISOString().replace(/[:.]/g, "-") + "_" + randomId(4);
+
   log("environment:", {
     codioIDEPresent: !!codioIDE,
-    filesApi: !!(codioIDE && codioIDE.files),
     filesAdd: typeof (codioIDE && codioIDE.files && codioIDE.files.add),
-    filesGetContent: typeof (codioIDE && codioIDE.files && codioIDE.files.getContent),
     coachBotApi: !!(codioIDE && codioIDE.coachBot),
     location: window.location && window.location.href,
     inIframe: window.top !== window,
-    iframesInDocument: document.querySelectorAll("iframe").length
+    sessionId: SESSION_ID
   });
 
-  if (!codioIDE || !codioIDE.files) {
-    error("codioIDE.files is not available; cannot write a log file. Stopping.");
+  if (!codioIDE || !codioIDE.files || typeof codioIDE.files.add !== "function") {
+    error("codioIDE.files.add is not available; cannot write log files. Stopping.");
     return;
   }
 
-  // Wrap an API call so a hang shows up in the console instead of stalling silently
+  // ---------------- State ----------------
+  let dirIndex = 0;          // which entry of CONFIG.logDirs we're currently using
+  let dirConfirmed = false;  // true once a write has succeeded in that folder
+  let fileCounter = 0;
+  let pending = [];
+  let writeTimer = null;
+  let writing = Promise.resolve();
+  let lastEvent = { time: 0, text: null };
+  let copyCount = 0;
+  let filesWritten = 0;
+  const watchedDocs = new WeakSet();
+
+  // ---------------- Helpers ----------------
+  function randomId(len) {
+    return Math.random().toString(36).slice(2, 2 + len).padEnd(len, "0");
+  }
+
   function withTimeout(promise, label) {
     return Promise.race([
       promise,
@@ -53,44 +73,53 @@
     ]);
   }
 
-  // ---------------- State ----------------
-  let logPath = null;
-  let existingContent = "";
-  let pending = [];
-  let writeTimer = null;
-  let writing = Promise.resolve();
-  let lastEvent = { time: 0, text: null };
-  let copyCount = 0;
-  const watchedDocs = new WeakSet();
+  function errMsg(e) {
+    return e && e.message ? e.message : String(e);
+  }
 
-  // ---------------- Log file setup ----------------
-  async function initLogFile() {
-    for (const path of CONFIG.logPaths) {
-      log("trying log path:", path);
-      try {
-        let content = "";
+  function isAlreadyExists(e) {
+    return /already exists/i.test(errMsg(e));
+  }
+
+  function nextFileName() {
+    fileCounter++;
+    return "copy_" + SESSION_ID + "_" + String(fileCounter).padStart(4, "0") + "_" + randomId(4) + ".jsonl";
+  }
+
+  // Write content to a brand-new file, falling back to the next folder
+  // if the current one can't be written to.
+  async function writeNewFile(content) {
+    while (dirIndex < CONFIG.logDirs.length) {
+      const dir = CONFIG.logDirs[dirIndex];
+      for (let attempt = 0; attempt <= CONFIG.maxNameRetries; attempt++) {
+        const path = dir + "/" + nextFileName();
         try {
-          content = (await withTimeout(codioIDE.files.getContent(path), "getContent(" + path + ")")) || "";
-          log("  existing file found,", content.length, "chars");
+          await withTimeout(codioIDE.files.add(path, content), "add(" + path + ")");
+          if (!dirConfirmed) log("✓ folder is writable, using", dir);
+          dirConfirmed = true;
+          return path;
         } catch (e) {
-          log("  no existing file (or read failed):", e && e.message ? e.message : e);
-          content = "";
+          if (isAlreadyExists(e)) {
+            warn("  name already taken, trying another:", path);
+            continue; // same folder, new name
+          }
+          if (dirConfirmed) {
+            // This folder worked before, so treat it as a temporary problem
+            throw e;
+          }
+          warn("  ✗ cannot write in", dir, "-", errMsg(e));
+          break; // try the next folder
         }
-        await withTimeout(codioIDE.files.add(path, content), "add(" + path + ")");
-        logPath = path;
-        existingContent = content;
-        log("  ✓ write test passed, logging to", path);
-        return;
-      } catch (e) {
-        warn("  ✗ cannot write to", path, "-", e && e.message ? e.message : e);
       }
+      if (dirConfirmed) throw new Error("could not find a free file name in " + dir);
+      dirIndex++;
+      if (dirIndex < CONFIG.logDirs.length) log("falling back to", CONFIG.logDirs[dirIndex]);
     }
-    error("no writable log path found; copies will be buffered in memory only");
+    throw new Error("no writable folder found in " + JSON.stringify(CONFIG.logDirs));
   }
 
   function scheduleWrite() {
     if (writeTimer) return;
-    log("write scheduled in", CONFIG.writeDebounceMs, "ms");
     writeTimer = setTimeout(() => {
       writeTimer = null;
       flush();
@@ -100,29 +129,28 @@
   function flush() {
     writing = writing.then(async () => {
       if (pending.length === 0) return;
-      if (!logPath) {
-        warn("flush skipped: no log path yet,", pending.length, "record(s) buffered");
-        return;
-      }
       const batch = pending;
       pending = [];
-      const lines = batch.map((r) => JSON.stringify(r)).join("\n") + "\n";
-      const newContent = existingContent + lines;
-      log("writing", batch.length, "record(s) to", logPath);
+      const content = batch.map((r) => JSON.stringify(r)).join("\n") + "\n";
+      log("writing", batch.length, "record(s) to a new file");
       try {
-        await withTimeout(codioIDE.files.add(logPath, newContent), "add(" + logPath + ")");
-        existingContent = newContent;
-        log("  ✓ write succeeded, file is now", newContent.length, "chars");
+        const path = await writeNewFile(content);
+        filesWritten++;
+        log("  ✓ wrote", path);
       } catch (e) {
-        error("  ✗ write failed, will retry:", e && e.message ? e.message : e);
-        pending = batch.concat(pending);
-        scheduleWrite();
+        error("  ✗ write failed:", errMsg(e));
+        if (dirIndex < CONFIG.logDirs.length) {
+          pending = batch.concat(pending);
+          scheduleWrite();
+        } else {
+          error("  giving up; records kept in memory only. See window.__copyLogger.pendingRecords()");
+          pending = batch.concat(pending);
+        }
       }
     });
     return writing;
   }
 
-  // ---------------- Helpers ----------------
   function getCopiedText(event) {
     const target = event.target;
     if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT")) {
@@ -164,7 +192,7 @@
       const page = ctx && ctx.guidesPage;
       return page ? (page.title || page.id || page) : undefined;
     } catch (e) {
-      warn("could not read guides page:", e && e.message ? e.message : e);
+      warn("could not read guides page:", errMsg(e));
       return undefined;
     }
   }
@@ -176,8 +204,7 @@
     const now = Date.now();
     log("copy event #" + copyCount, {
       target: describeTarget(event.target),
-      textLength: text.length,
-      inIframe: !!(event.target && event.target.ownerDocument && event.target.ownerDocument !== document)
+      textLength: text.length
     });
 
     if (now - lastEvent.time < CONFIG.dedupeWindowMs && text === lastEvent.text) {
@@ -189,6 +216,7 @@
     const record = {
       event: "copy",
       timestamp: new Date(now).toISOString(),
+      session: SESSION_ID,
       length: text.length,
       lines: text ? text.split("\n").length : 0,
       source: describeTarget(event.target),
@@ -209,20 +237,18 @@
 
   // ---------------- Attach listeners ----------------
   function watchDocument(doc, label) {
-    if (!doc) { warn("watchDocument: no document for", label); return; }
-    if (watchedDocs.has(doc)) return;
+    if (!doc || watchedDocs.has(doc)) return;
     watchedDocs.add(doc);
     doc.addEventListener("copy", onCopy, true);
-    log("✓ listening for copy in", label, "-", (doc.location && doc.location.href) || "(no href)");
+    log("✓ listening for copy in", label);
     watchIframes(doc, label);
   }
 
   function tryWatchIframe(iframe, parentLabel) {
-    const name = parentLabel + " > iframe" + (iframe.id ? "#" + iframe.id : "") + (iframe.src ? " [" + iframe.src.slice(0, 80) + "]" : "");
+    const name = parentLabel + " > iframe" + (iframe.id ? "#" + iframe.id : "");
     const attach = () => {
       try {
         if (iframe.contentDocument) watchDocument(iframe.contentDocument, name);
-        else warn("no contentDocument (likely cross-origin):", name);
       } catch (e) {
         warn("cannot watch cross-origin iframe:", name);
       }
@@ -232,9 +258,7 @@
   }
 
   function watchIframes(doc, label) {
-    const frames = doc.querySelectorAll("iframe");
-    if (frames.length) log("found", frames.length, "iframe(s) in", label);
-    frames.forEach((f) => tryWatchIframe(f, label));
+    doc.querySelectorAll("iframe").forEach((f) => tryWatchIframe(f, label));
     try {
       const observer = new MutationObserver((mutations) => {
         for (const m of mutations) {
@@ -250,20 +274,13 @@
     }
   }
 
-  function safeTopDocument() {
-    try {
-      return window.top.document;
-    } catch (e) {
-      warn("window.top is cross-origin; can only watch this frame. Copies elsewhere in the IDE will be missed.");
-      return null;
-    }
-  }
-
-  // Attach listeners FIRST so a slow/failed file API doesn't stop detection
   watchDocument(document, "extension document");
   if (window.top !== window) {
-    const topDoc = safeTopDocument();
-    if (topDoc) watchDocument(topDoc, "top document");
+    try {
+      watchDocument(window.top.document, "top document");
+    } catch (e) {
+      warn("window.top is cross-origin; copies outside this frame will be missed.");
+    }
   }
 
   window.addEventListener("visibilitychange", () => {
@@ -273,16 +290,20 @@
 
   // Manual test hooks: run these in the console
   window.__copyLogger = {
-    status: () => ({ logPath, pending: pending.length, copyCount, existingChars: existingContent.length }),
+    status: () => ({
+      folder: CONFIG.logDirs[dirIndex] || "(none writable)",
+      folderConfirmed: dirConfirmed,
+      session: SESSION_ID,
+      copyCount,
+      filesWritten,
+      pending: pending.length
+    }),
+    pendingRecords: () => pending.slice(),
     flush: () => flush(),
     testWrite: () => {
-      pending.push({ event: "manual-test", timestamp: new Date().toISOString() });
+      pending.push({ event: "manual-test", timestamp: new Date().toISOString(), session: SESSION_ID });
       return flush();
     }
   };
-  log("debug helpers available: window.__copyLogger.status(), .testWrite(), .flush()");
-
-  await initLogFile();
-  log("init complete:", window.__copyLogger.status());
-  if (pending.length) flush();
+  log("ready. Debug helpers: window.__copyLogger.status(), .testWrite(), .flush()");
 })(window.codioIDE, window);
