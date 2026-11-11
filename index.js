@@ -1,22 +1,57 @@
-// Codio extension: Copy Logger
+// Codio extension: Copy Logger (debug build)
 // Detects copy actions (Ctrl/Cmd+C, right-click > Copy, Edit menu > Copy)
 // and appends a record of each one to a log file in the workspace.
+// All console output is prefixed with [copy-logger] so you can filter on it.
 
 (async function (codioIDE, window) {
+  const TAG = "[copy-logger]";
+  const log = (...a) => console.log(TAG, ...a);
+  const warn = (...a) => console.warn(TAG, ...a);
+  const error = (...a) => console.error(TAG, ...a);
+
+  log("script loaded at", new Date().toISOString());
+
   // ---------------- Configuration ----------------
   const CONFIG = {
-    // Tried in order; the first path that can be written is used.
     logPaths: [
-      "secure/copy-log.jsonl", // hidden from students in assignments
-      "copy-log.jsonl",
-      "copy-log.jsonl"                 // workspace root fallback
+      ".guides/secure/copy-log.jsonl",
+      ".guides/copy-log.jsonl",
+      "copy-log.jsonl"
     ],
-    includeCopiedText: false, // set true to store the copied text itself
-    maxTextLength: 500,       // truncate stored text to this many characters
-    dedupeWindowMs: 250,      // ignore duplicate events fired within this window
-    writeDebounceMs: 1000,    // batch writes so rapid copies don't spam the API
-    includeGuidesPage: true   // try to record which guide page was open
+    includeCopiedText: false,
+    maxTextLength: 500,
+    dedupeWindowMs: 250,
+    writeDebounceMs: 1000,
+    includeGuidesPage: true,
+    apiTimeoutMs: 5000 // any API call slower than this is treated as failed
   };
+
+  // ---------------- Environment checks ----------------
+  log("environment:", {
+    codioIDEPresent: !!codioIDE,
+    filesApi: !!(codioIDE && codioIDE.files),
+    filesAdd: typeof (codioIDE && codioIDE.files && codioIDE.files.add),
+    filesGetContent: typeof (codioIDE && codioIDE.files && codioIDE.files.getContent),
+    coachBotApi: !!(codioIDE && codioIDE.coachBot),
+    location: window.location && window.location.href,
+    inIframe: window.top !== window,
+    iframesInDocument: document.querySelectorAll("iframe").length
+  });
+
+  if (!codioIDE || !codioIDE.files) {
+    error("codioIDE.files is not available; cannot write a log file. Stopping.");
+    return;
+  }
+
+  // Wrap an API call so a hang shows up in the console instead of stalling silently
+  function withTimeout(promise, label) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(label + " timed out after " + CONFIG.apiTimeoutMs + "ms")), CONFIG.apiTimeoutMs)
+      )
+    ]);
+  }
 
   // ---------------- State ----------------
   let logPath = null;
@@ -25,33 +60,37 @@
   let writeTimer = null;
   let writing = Promise.resolve();
   let lastEvent = { time: 0, text: null };
+  let copyCount = 0;
   const watchedDocs = new WeakSet();
 
   // ---------------- Log file setup ----------------
   async function initLogFile() {
     for (const path of CONFIG.logPaths) {
+      log("trying log path:", path);
       try {
         let content = "";
         try {
-          content = (await codioIDE.files.getContent(path)) || "";
+          content = (await withTimeout(codioIDE.files.getContent(path), "getContent(" + path + ")")) || "";
+          log("  existing file found,", content.length, "chars");
         } catch (e) {
-          content = ""; // file doesn't exist yet
+          log("  no existing file (or read failed):", e && e.message ? e.message : e);
+          content = "";
         }
-        // Prove we can write here before committing to this path
-        await codioIDE.files.add(path, content);
+        await withTimeout(codioIDE.files.add(path, content), "add(" + path + ")");
         logPath = path;
         existingContent = content;
-        console.log("[copy-logger] logging to", path);
+        log("  ✓ write test passed, logging to", path);
         return;
       } catch (e) {
-        console.warn("[copy-logger] cannot write to", path, e);
+        warn("  ✗ cannot write to", path, "-", e && e.message ? e.message : e);
       }
     }
-    console.error("[copy-logger] no writable log path found");
+    error("no writable log path found; copies will be buffered in memory only");
   }
 
   function scheduleWrite() {
     if (writeTimer) return;
+    log("write scheduled in", CONFIG.writeDebounceMs, "ms");
     writeTimer = setTimeout(() => {
       writeTimer = null;
       flush();
@@ -59,18 +98,23 @@
   }
 
   function flush() {
-    // Chain writes so they never overlap
     writing = writing.then(async () => {
-      if (!logPath || pending.length === 0) return;
+      if (pending.length === 0) return;
+      if (!logPath) {
+        warn("flush skipped: no log path yet,", pending.length, "record(s) buffered");
+        return;
+      }
       const batch = pending;
       pending = [];
       const lines = batch.map((r) => JSON.stringify(r)).join("\n") + "\n";
       const newContent = existingContent + lines;
+      log("writing", batch.length, "record(s) to", logPath);
       try {
-        await codioIDE.files.add(logPath, newContent);
+        await withTimeout(codioIDE.files.add(logPath, newContent), "add(" + logPath + ")");
         existingContent = newContent;
+        log("  ✓ write succeeded, file is now", newContent.length, "chars");
       } catch (e) {
-        console.error("[copy-logger] write failed, will retry", e);
+        error("  ✗ write failed, will retry:", e && e.message ? e.message : e);
         pending = batch.concat(pending);
         scheduleWrite();
       }
@@ -81,14 +125,13 @@
   // ---------------- Helpers ----------------
   function getCopiedText(event) {
     const target = event.target;
-    // Editors like Ace keep the selection in a hidden textarea
     if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT")) {
       try {
         const { selectionStart, selectionEnd, value } = target;
         if (typeof selectionStart === "number" && selectionEnd > selectionStart) {
           return value.substring(selectionStart, selectionEnd);
         }
-      } catch (e) { /* some input types don't support selection */ }
+      } catch (e) { /* ignore */ }
     }
     try {
       const doc = (target && target.ownerDocument) || document;
@@ -105,7 +148,6 @@
     if (typeof el.className === "string" && el.className.trim()) {
       desc += "." + el.className.trim().split(/\s+/).slice(0, 3).join(".");
     }
-    // Walk up to find a recognisable region of the IDE
     const region = el.closest && el.closest(
       "[class*='editor'], [class*='ace'], [class*='monaco'], [class*='terminal'], [class*='xterm'], [class*='guide']"
     );
@@ -116,26 +158,32 @@
   }
 
   async function getGuidesPage() {
-    if (!CONFIG.includeGuidesPage) return undefined;
+    if (!CONFIG.includeGuidesPage || !codioIDE.coachBot) return undefined;
     try {
-      const ctx = await Promise.race([
-        codioIDE.coachBot.getContext(),
-        new Promise((resolve) => setTimeout(() => resolve(null), 1500))
-      ]);
+      const ctx = await withTimeout(codioIDE.coachBot.getContext(), "coachBot.getContext()");
       const page = ctx && ctx.guidesPage;
       return page ? (page.title || page.id || page) : undefined;
     } catch (e) {
+      warn("could not read guides page:", e && e.message ? e.message : e);
       return undefined;
     }
   }
 
   // ---------------- Copy handler ----------------
   async function onCopy(event) {
+    copyCount++;
     const text = getCopiedText(event);
     const now = Date.now();
+    log("copy event #" + copyCount, {
+      target: describeTarget(event.target),
+      textLength: text.length,
+      inIframe: !!(event.target && event.target.ownerDocument && event.target.ownerDocument !== document)
+    });
 
-    // The same copy can bubble through several listeners; record it once
-    if (now - lastEvent.time < CONFIG.dedupeWindowMs && text === lastEvent.text) return;
+    if (now - lastEvent.time < CONFIG.dedupeWindowMs && text === lastEvent.text) {
+      log("  duplicate within", CONFIG.dedupeWindowMs, "ms, ignored");
+      return;
+    }
     lastEvent = { time: now, text };
 
     const record = {
@@ -155,56 +203,86 @@
     if (page !== undefined) record.guidesPage = page;
 
     pending.push(record);
+    log("  record queued, pending:", pending.length);
     scheduleWrite();
   }
 
   // ---------------- Attach listeners ----------------
-  function watchDocument(doc) {
-    if (!doc || watchedDocs.has(doc)) return;
+  function watchDocument(doc, label) {
+    if (!doc) { warn("watchDocument: no document for", label); return; }
+    if (watchedDocs.has(doc)) return;
     watchedDocs.add(doc);
-    // The "copy" event fires for keyboard shortcuts, context-menu Copy,
-    // and browser Edit > Copy alike. Capture phase so editors that
-    // stop propagation can't hide it from us.
     doc.addEventListener("copy", onCopy, true);
-    watchIframes(doc);
+    log("✓ listening for copy in", label, "-", (doc.location && doc.location.href) || "(no href)");
+    watchIframes(doc, label);
   }
 
-  function tryWatchIframe(iframe) {
+  function tryWatchIframe(iframe, parentLabel) {
+    const name = parentLabel + " > iframe" + (iframe.id ? "#" + iframe.id : "") + (iframe.src ? " [" + iframe.src.slice(0, 80) + "]" : "");
     const attach = () => {
       try {
-        // Only works for same-origin iframes; cross-origin throws
-        if (iframe.contentDocument) watchDocument(iframe.contentDocument);
-      } catch (e) { /* cross-origin: cannot observe */ }
+        if (iframe.contentDocument) watchDocument(iframe.contentDocument, name);
+        else warn("no contentDocument (likely cross-origin):", name);
+      } catch (e) {
+        warn("cannot watch cross-origin iframe:", name);
+      }
     };
     attach();
     iframe.addEventListener("load", attach);
   }
 
-  function watchIframes(doc) {
-    doc.querySelectorAll("iframe").forEach(tryWatchIframe);
-    const observer = new MutationObserver((mutations) => {
-      for (const m of mutations) {
-        m.addedNodes.forEach((node) => {
-          if (node.tagName === "IFRAME") tryWatchIframe(node);
-          else if (node.querySelectorAll) node.querySelectorAll("iframe").forEach(tryWatchIframe);
-        });
-      }
-    });
-    observer.observe(doc.documentElement || doc.body, { childList: true, subtree: true });
+  function watchIframes(doc, label) {
+    const frames = doc.querySelectorAll("iframe");
+    if (frames.length) log("found", frames.length, "iframe(s) in", label);
+    frames.forEach((f) => tryWatchIframe(f, label));
+    try {
+      const observer = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          m.addedNodes.forEach((node) => {
+            if (node.tagName === "IFRAME") tryWatchIframe(node, label);
+            else if (node.querySelectorAll) node.querySelectorAll("iframe").forEach((f) => tryWatchIframe(f, label));
+          });
+        }
+      });
+      observer.observe(doc.documentElement || doc.body, { childList: true, subtree: true });
+    } catch (e) {
+      warn("could not observe new iframes in", label, e);
+    }
   }
 
-  // Flush anything pending if the tab is hidden or closed
+  function safeTopDocument() {
+    try {
+      return window.top.document;
+    } catch (e) {
+      warn("window.top is cross-origin; can only watch this frame. Copies elsewhere in the IDE will be missed.");
+      return null;
+    }
+  }
+
+  // Attach listeners FIRST so a slow/failed file API doesn't stop detection
+  watchDocument(document, "extension document");
+  if (window.top !== window) {
+    const topDoc = safeTopDocument();
+    if (topDoc) watchDocument(topDoc, "top document");
+  }
+
   window.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") flush();
   });
   window.addEventListener("beforeunload", () => flush());
 
-  await initLogFile();
-  // Start listening even if the log file failed; records stay buffered
-  watchDocument(window.top && window.top !== window ? safeTopDocument() : document);
-  watchDocument(document);
+  // Manual test hooks: run these in the console
+  window.__copyLogger = {
+    status: () => ({ logPath, pending: pending.length, copyCount, existingChars: existingContent.length }),
+    flush: () => flush(),
+    testWrite: () => {
+      pending.push({ event: "manual-test", timestamp: new Date().toISOString() });
+      return flush();
+    }
+  };
+  log("debug helpers available: window.__copyLogger.status(), .testWrite(), .flush()");
 
-  function safeTopDocument() {
-    try { return window.top.document; } catch (e) { return document; }
-  }
+  await initLogFile();
+  log("init complete:", window.__copyLogger.status());
+  if (pending.length) flush();
 })(window.codioIDE, window);
