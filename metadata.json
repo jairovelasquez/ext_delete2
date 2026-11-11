@@ -2,7 +2,7 @@
   "name": "Catch Copy",
   "type": "helper",
   "properties": {
-    "user_type": "instructor", 
+    "user_type": "all", 
     "component": "all"
   }
 }

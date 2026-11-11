@@ -14,8 +14,8 @@
   // ---------------- Configuration ----------------
   const CONFIG = {
     logPaths: [
-      ".guides/secure/copy-log.jsonl",
-      ".guides/copy-log.jsonl",
+      "secure/copy-log.jsonl",
+      "copy-log.jsonl",
       "copy-log.jsonl"
     ],
     includeCopiedText: false,
