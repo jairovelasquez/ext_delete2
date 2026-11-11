@@ -7,8 +7,8 @@
   const CONFIG = {
     // Tried in order; the first path that can be written is used.
     logPaths: [
-      ".guides/secure/copy-log.jsonl", // hidden from students in assignments
-      ".guides/copy-log.jsonl",
+      "secure/copy-log.jsonl", // hidden from students in assignments
+      "copy-log.jsonl",
       "copy-log.jsonl"                 // workspace root fallback
     ],
     includeCopiedText: false, // set true to store the copied text itself
